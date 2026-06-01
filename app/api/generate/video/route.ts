@@ -1,18 +1,99 @@
 import { NextRequest, NextResponse } from 'next/server';
-import OpenAI from 'openai';
 
-function getOpenAI() {
-  if (!process.env.OPENAI_API_KEY) {
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_BASE_URL = process.env.OPENAI_API_BASE_URL ?? 'https://api.openai.com/v1';
+
+function requireOpenAIKey() {
+  if (!OPENAI_API_KEY) {
     throw new Error('OpenAI API key is not configured');
   }
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 120000 });
 }
 
-async function fetchVideoUrl(openai: OpenAI, videoId: string) {
-  const content = await openai.videos.downloadContent(videoId);
-  const buffer = await content.arrayBuffer();
-  const base64 = Buffer.from(buffer).toString('base64');
-  return `data:video/mp4;base64,${base64}`;
+function buildOpenAIUrl(path: string) {
+  const trimmedBase = OPENAI_API_BASE_URL.replace(/\/$/, '');
+  return path.startsWith('/') ? `${trimmedBase}${path}` : `${trimmedBase}/${path}`;
+}
+
+async function parseOpenAIError(response: Response) {
+  const errorBody = await response.text();
+  try {
+    const json = JSON.parse(errorBody);
+    return json;
+  } catch {
+    return errorBody;
+  }
+}
+
+async function openAIJsonRequest(path: string, method: string, body?: unknown) {
+  requireOpenAIKey();
+
+  const response = await fetch(buildOpenAIUrl(path), {
+    method,
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const payload = await response.text();
+  const json = payload ? JSON.parse(payload) : null;
+
+  if (!response.ok) {
+    const errorPayload = json ?? payload;
+    throw new Error(
+      `OpenAI request failed (${response.status}): ${JSON.stringify(errorPayload)}`,
+    );
+  }
+
+  return json;
+}
+
+async function openAIGetRequest(path: string) {
+  requireOpenAIKey();
+
+  const response = await fetch(buildOpenAIUrl(path), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Accept: 'application/json',
+    },
+  });
+
+  const payload = await response.text();
+  const json = payload ? JSON.parse(payload) : null;
+
+  if (!response.ok) {
+    const errorPayload = json ?? payload;
+    throw new Error(
+      `OpenAI request failed (${response.status}): ${JSON.stringify(errorPayload)}`,
+    );
+  }
+
+  return json;
+}
+
+async function fetchVideoUrl(videoId: string) {
+  requireOpenAIKey();
+
+  const response = await fetch(buildOpenAIUrl(`/videos/${videoId}/content`), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Accept: 'application/octet-stream',
+    },
+  });
+
+  if (!response.ok) {
+    const errorPayload = await parseOpenAIError(response);
+    throw new Error(
+      `OpenAI video content request failed (${response.status}): ${JSON.stringify(errorPayload)}`,
+    );
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return `data:video/mp4;base64,${buffer.toString('base64')}`;
 }
 
 function normalizeError(error: unknown) {
@@ -30,13 +111,6 @@ function normalizeError(error: unknown) {
     if (anyError.response) {
       details.response = anyError.response;
     }
-    if (anyError.code) {
-      details.code = anyError.code;
-    }
-    if (anyError.type) {
-      details.type = anyError.type;
-    }
-
     if (anyError.status) {
       details.status = anyError.status;
     }
@@ -54,7 +128,7 @@ export async function POST(request: NextRequest) {
     if (!prompt) {
       return NextResponse.json(
         { error: 'Prompt is required' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -62,24 +136,16 @@ export async function POST(request: NextRequest) {
       ? duration
       : Math.min(12, Math.max(4, Math.round(duration / 4) * 4));
 
-    const openai = getOpenAI();
-    const video = await openai.videos.create({
+    const video = await openAIJsonRequest('/videos', 'POST', {
       prompt,
       model: 'sora-2',
       seconds,
       size: '1280x720',
     });
 
-    if (video.error) {
-      return NextResponse.json(
-        { error: video.error.message || 'Video generation failed', errorCode: video.error.code || null },
-        { status: 500 }
-      );
-    }
-
     let videoUrl: string | null = null;
     if (video.status === 'completed') {
-      videoUrl = await fetchVideoUrl(openai, video.id);
+      videoUrl = await fetchVideoUrl(video.id);
     }
 
     return NextResponse.json({
@@ -96,11 +162,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         error: normalized.message || 'Failed to generate video',
-        errorType: normalized.type || normalized.name || 'UnknownError',
-        errorCode: normalized.code || null,
+        errorType: normalized.name || normalized.type || 'UnknownError',
         errorDetails: normalized.response ?? normalized.stack ?? null,
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
@@ -111,20 +176,18 @@ export async function GET(request: NextRequest) {
 
   if (probe === '1') {
     try {
-      const openai = getOpenAI();
-      const models = await openai.models.list();
-      return NextResponse.json({ status: 'ok', modelCount: models.data?.length ?? 0 });
+      const models = await openAIGetRequest('/models');
+      return NextResponse.json({ status: 'ok', modelCount: models?.data?.length ?? 0 });
     } catch (error) {
       const normalized = normalizeError(error);
       console.error('OpenAI probe error:', normalized);
       return NextResponse.json(
         {
           error: normalized.message || 'Failed to probe OpenAI',
-          errorType: normalized.type || normalized.name || 'UnknownError',
-          errorCode: normalized.code || null,
+          errorType: normalized.name || normalized.type || 'UnknownError',
           errorDetails: normalized.response ?? normalized.stack ?? null,
         },
-        { status: 500 }
+        { status: 500 },
       );
     }
   }
@@ -138,19 +201,11 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const openai = getOpenAI();
-    const video = await openai.videos.retrieve(videoId);
-
-    if (video.error) {
-      return NextResponse.json(
-        { error: video.error.message || 'Unable to retrieve video status' },
-        { status: 500 }
-      );
-    }
+    const video = await openAIGetRequest(`/videos/${videoId}`);
 
     let videoUrl: string | null = null;
     if (video.status === 'completed') {
-      videoUrl = await fetchVideoUrl(openai, video.id);
+      videoUrl = await fetchVideoUrl(video.id);
     }
 
     return NextResponse.json({
@@ -166,11 +221,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(
       {
         error: normalized.message || 'Failed to retrieve video status',
-        errorType: normalized.type || normalized.name || 'UnknownError',
-        errorCode: normalized.code || null,
+        errorType: normalized.name || normalized.type || 'UnknownError',
         errorDetails: normalized.response ?? normalized.stack ?? null,
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
